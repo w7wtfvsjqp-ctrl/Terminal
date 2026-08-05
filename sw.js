@@ -1,19 +1,44 @@
 // Service Worker do PyWebIDE
 // Estratégia:
-//  - App shell (arquivos do próprio repositório): cache-first, com atualização em segundo plano.
-//  - Recursos de CDN (Monaco, Pyodide e seus pacotes .whl): cache-first "para sempre",
-//    pois são arquivos versionados e imutáveis — uma vez baixados, funcionam 100% offline.
+//  - Navegação (o próprio index.html): cache-first com atualização em segundo
+//    plano, MAS também injeta os cabeçalhos Cross-Origin-Opener-Policy e
+//    Cross-Origin-Embedder-Policy (modo "require-corp") na resposta. Isso é
+//    o que permite à página virar "cross-origin isolated" e liberar
+//    SharedArrayBuffer + Atomics.wait no worker.js — necessário pro input()
+//    inline no terminal funcionar sem popup. Hospedagens estáticas (GitHub
+//    Pages) não deixam configurar cabeçalhos HTTP de verdade, então é isso
+//    ou nada. Usamos "require-corp" (não "credentialless") porque é o modo
+//    que o Safari/iOS suporta de forma confiável e que o jsDelivr já atende
+//    nativamente (manda Cross-Origin-Resource-Policy: cross-origin).
+//  - App shell (demais arquivos do próprio repositório): cache-first, com
+//    atualização em segundo plano.
+//  - Recursos de CDN (Monaco, Pyodide e seus pacotes .whl): cache-first
+//    "para sempre", pois são arquivos versionados e imutáveis — uma vez
+//    baixados, funcionam 100% offline.
 
-const APP_CACHE = "pywebide-app-v1";
+const APP_CACHE = "pywebide-app-v2";
 const CDN_CACHE = "pywebide-cdn-v1";
 
 const APP_SHELL = [
   "./",
   "./index.html",
   "./manifest.json",
+  "./worker.js",
   "./icon-192.png",
   "./icon-512.png"
 ];
+
+function withIsolationHeaders(response) {
+  if (!response || response.status === 0) return response; // opaco: não mexe
+  const headers = new Headers(response.headers);
+  headers.set("Cross-Origin-Opener-Policy", "same-origin");
+  headers.set("Cross-Origin-Embedder-Policy", "require-corp");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -61,6 +86,27 @@ self.addEventListener("fetch", (event) => {
           return response;
         } catch (err) {
           if (cached) return cached;
+          throw err;
+        }
+      })
+    );
+    return;
+  }
+
+  // Navegação (documento principal): cache-first, mas SEMPRE injetando os
+  // cabeçalhos de isolamento de origem cruzada na resposta final.
+  if (event.request.mode === "navigate") {
+    event.respondWith(
+      caches.open(APP_CACHE).then(async (cache) => {
+        const cached = await cache.match(event.request);
+        try {
+          const response = await fetch(event.request);
+          if (response && response.status === 200) {
+            cache.put(event.request, response.clone());
+          }
+          return withIsolationHeaders(response);
+        } catch (err) {
+          if (cached) return withIsolationHeaders(cached);
           throw err;
         }
       })
