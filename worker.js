@@ -69,6 +69,15 @@ let sharedControl = null; // Int32Array: [0]=status, [1]=tamanho da resposta
 let sharedText = null;    // Uint16Array: code units UTF-16 da resposta
 let inputChannelAvailable = false;
 
+// ---------- Diagnóstico: reporta o estado real de isolamento do worker ----------
+// Isso roda sempre, independente de dar certo ou não, pra dar pra ver na tela
+// do app (sem precisar de Mac/Web Inspector) o que exatamente está falhando.
+self.postMessage({
+  type: "coi-diag",
+  workerCrossOriginIsolated: self.crossOriginIsolated,
+  sharedArrayBufferDefined: typeof SharedArrayBuffer !== "undefined",
+});
+
 (function setupInputChannel() {
   try {
     if (typeof SharedArrayBuffer === "undefined" || !self.crossOriginIsolated) {
