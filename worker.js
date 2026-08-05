@@ -1,11 +1,25 @@
-/* worker.js — roda em um Web Worker separado da UI.
-   Responsável por: carregar o Pyodide, detectar e carregar pacotes (pandas, numpy...),
-   executar o código do usuário, e expor um "tkinter" falso que traduz chamadas
-   Python em mensagens para a thread principal desenhar como HTML/Canvas real. */
+// worker.js — roda o Pyodide dentro de um Web Worker de verdade.
+//
+// Por que um Worker (e não a thread principal)? Porque só um Worker pode
+// chamar Atomics.wait() e bloquear de verdade — o que permite implementar
+// input() como um campo de texto inline no terminal (sem window.prompt(),
+// sem popup, sem botão de confirmar/cancelar), igual ao terminal do VSCode.
+//
+// Isso exige que a página esteja "cross-origin isolated" (COOP/COEP), pra
+// que o navegador libere o uso de SharedArrayBuffer. Quem cuida disso é o
+// sw.js (injeta os cabeçalhos na navegação, já que hospedagens estáticas
+// como GitHub Pages não deixam configurar cabeçalhos HTTP de verdade).
+//
+// Canal de input: um SharedArrayBuffer de controle (2 int32: status e
+// tamanho da resposta) + um SharedArrayBuffer de texto (Uint16, um code
+// unit UTF-16 por posição — o mesmo formato interno das strings JS).
+// Fluxo: builtins.input() -> js.requestInputSync(prompt) -> posta
+// "input-request" pro thread principal -> Atomics.wait() bloqueia o worker
+// -> thread principal escreve a resposta no buffer e chama Atomics.notify()
+// -> o worker acorda, lê a string e devolve pro Python.
 
-importScripts("https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js");
+const PYODIDE_CDN = "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js";
 
-// Nomes de import -> nome do pacote Pyodide (quando diferem)
 const PACKAGE_MAP = {
   numpy: "numpy",
   pandas: "pandas",
@@ -34,9 +48,75 @@ function detectPackages(code) {
   return [...found];
 }
 
-function post(type, extra) {
-  postMessage(JSON.stringify(Object.assign({ type }, extra || {})));
+function post(obj) {
+  self.postMessage(JSON.stringify(obj));
 }
+
+// Eventos que o runtime Python emite (stdout, stderr, widgets de GUI etc.)
+// chegam aqui e viram postMessage de string JSON — o formato que
+// index.html já sabe interpretar via handleWorkerMessage.
+self.dispatchPyEvent = function (jsonStr) {
+  self.postMessage(jsonStr);
+};
+
+// ---------- Canal de input() bloqueante via SharedArrayBuffer ----------
+const MAX_INPUT_CHARS = 4096;
+const STATUS_IDLE = 0;
+const STATUS_PENDING = 1;
+const STATUS_READY = 2;
+
+let sharedControl = null; // Int32Array: [0]=status, [1]=tamanho da resposta
+let sharedText = null;    // Uint16Array: code units UTF-16 da resposta
+let inputChannelAvailable = false;
+
+(function setupInputChannel() {
+  try {
+    if (typeof SharedArrayBuffer === "undefined" || !self.crossOriginIsolated) {
+      inputChannelAvailable = false;
+      return;
+    }
+    const controlBuf = new SharedArrayBuffer(8); // 2 x int32
+    const textBuf = new SharedArrayBuffer(MAX_INPUT_CHARS * 2); // 2 bytes por code unit
+    sharedControl = new Int32Array(controlBuf);
+    sharedText = new Uint16Array(textBuf);
+    inputChannelAvailable = true;
+    // Handoff dos buffers: precisa ser um postMessage "cru" (não JSON string),
+    // já que SharedArrayBuffer não pode ser serializado em texto.
+    self.postMessage({
+      type: "input-channel",
+      available: true,
+      controlBuffer: controlBuf,
+      textBuffer: textBuf,
+      maxChars: MAX_INPUT_CHARS,
+    });
+  } catch (err) {
+    inputChannelAvailable = false;
+    self.postMessage({ type: "input-channel", available: false });
+  }
+})();
+
+// Exposto ao Python via `js.requestInputSync(prompt)`. Bloqueia de verdade
+// a thread do worker até o usuário digitar e apertar Enter no campo inline.
+self.requestInputSync = function (promptText) {
+  if (!inputChannelAvailable) {
+    // Sem isolamento de origem cruzada não há como bloquear de verdade.
+    // Sinaliza EOF pro Python em vez de travar o worker sem saída.
+    post({
+      type: "stderr",
+      text: "input() indisponível: o isolamento de origem cruzada (COOP/COEP) ainda não está ativo nesta página. Recarregue e tente novamente.\n",
+    });
+    return null;
+  }
+  Atomics.store(sharedControl, 0, STATUS_PENDING);
+  Atomics.store(sharedControl, 1, 0);
+  post({ type: "input-request", prompt: promptText || "" });
+  Atomics.wait(sharedControl, 0, STATUS_PENDING); // bloqueia até status virar STATUS_READY
+  const len = Atomics.load(sharedControl, 1);
+  let out = "";
+  for (let i = 0; i < len; i++) out += String.fromCharCode(sharedText[i]);
+  Atomics.store(sharedControl, 0, STATUS_IDLE);
+  return out;
+};
 
 // ---- Código Python que define o runtime + o shim de tkinter ----
 const PY_RUNTIME = `
@@ -44,7 +124,7 @@ import sys, json, traceback
 import js
 
 def _post(d):
-    js.postMessage(json.dumps(d))
+    js.dispatchPyEvent(json.dumps(d))
 
 class _JSStream:
     def __init__(self, kind):
@@ -55,6 +135,18 @@ class _JSStream:
         return len(s)
     def flush(self):
         pass
+
+def _blocking_input(prompt=""):
+    # O prompt e o texto digitado já são mostrados pela UI (campo inline no
+    # terminal) do lado JS — o Python não precisa (nem deve) escrever nada
+    # em stdout aqui, senão duplicaria a linha.
+    line = js.requestInputSync(str(prompt))
+    if line is None:
+        raise EOFError("EOF ao ler input() (isolamento de origem cruzada indisponível)")
+    return str(line)
+
+import builtins
+builtins.input = _blocking_input
 
 _user_globals = {}
 
@@ -183,6 +275,44 @@ class _Widget:
     def winfo_children(self):
         return list(self._children)
 
+    def register(self, func):
+        cid = _reg_callback(func)
+        return "@@cb:" + cid
+
+    def winfo_screenwidth(self):
+        # Não existe "screen" dentro de um Web Worker (só na thread
+        # principal), então usamos um valor best-effort fixo.
+        return 1920
+
+    def winfo_screenheight(self):
+        return 1080
+
+    def winfo_width(self):
+        w = self._props.get("_width")
+        return int(w) if w else 1
+
+    def winfo_height(self):
+        h = self._props.get("_height")
+        return int(h) if h else 1
+
+    def winfo_reqwidth(self):
+        return self.winfo_width()
+
+    def winfo_reqheight(self):
+        return self.winfo_height()
+
+    def winfo_x(self):
+        return 0
+
+    def winfo_y(self):
+        return 0
+
+    def update(self):
+        pass
+
+    def update_idletasks(self):
+        pass
+
 
 class Tk(_Widget):
     _wtype = "root"
@@ -223,11 +353,6 @@ class Tk(_Widget):
         pass
     def update_idletasks(self):
         pass
-    def after(self, ms, func=None, *args):
-        if func is None:
-            return
-        cid = _reg_callback(lambda: func(*args))
-        _post({"type": "gui-after", "ms": ms, "cb": cid})
 
 Toplevel = Tk
 
@@ -335,19 +460,19 @@ class Canvas(_Widget):
 class _messagebox:
     @staticmethod
     def showinfo(title=None, message=None, **kw):
-        js.window.alert(str(message or title or ""))
+        pass
     @staticmethod
     def showwarning(title=None, message=None, **kw):
-        js.window.alert(str(message or title or ""))
+        pass
     @staticmethod
     def showerror(title=None, message=None, **kw):
-        js.window.alert(str(message or title or ""))
+        pass
     @staticmethod
     def askyesno(title=None, message=None, **kw):
-        return bool(js.window.confirm(str(message or title or "")))
+        return True
     @staticmethod
     def askokcancel(title=None, message=None, **kw):
-        return bool(js.window.confirm(str(message or title or "")))
+        return True
 
 messagebox = _messagebox()
 
@@ -358,7 +483,6 @@ W="w"; E="e"; N="n"; S="s"; NW="nw"; NE="ne"; SW="sw"; SE="se"; CENTER="center"
 END="end"; INSERT="insert"
 HORIZONTAL="horizontal"; VERTICAL="vertical"
 
-# registra este módulo como "tkinter" e cria o submódulo messagebox
 import types
 _mod = types.ModuleType("tkinter")
 for _name, _val in list(globals().items()):
@@ -427,6 +551,22 @@ def handle_gui_event(raw):
             w = _widgets.get(data.get("id"))
             if w is not None:
                 w._props["_selection"] = tuple(data.get("indices", []))
+        elif kind == "validate":
+            cb = _callbacks.get(data.get("cb"))
+            ok = True
+            if cb:
+                try:
+                    ok = bool(cb(data.get("value", "")))
+                except Exception:
+                    _post({"type": "stderr", "text": traceback.format_exc()})
+                    ok = True
+            _post({
+                "type": "validate-result",
+                "id": data.get("targetId"),
+                "valid": ok,
+                "value": data.get("value", ""),
+            })
+            return
         cb = _callbacks.get(data.get("cb"))
         if cb:
             try:
@@ -437,21 +577,27 @@ def handle_gui_event(raw):
         sys.stdout, sys.stderr = old_out, old_err
 `;
 
+// ---------- Boot: carrega o Pyodide dentro do próprio Worker ----------
 let pyodide = null;
 let runUserCode = null;
 let handleGuiEvent = null;
-const initPromise = (async () => {
-  post("status", { text: "Baixando Pyodide..." });
+
+async function boot() {
+  post({ type: "status", text: "Baixando Pyodide..." });
+  importScripts(PYODIDE_CDN);
   pyodide = await loadPyodide();
-  post("status", { text: "Preparando runtime Python..." });
+  post({ type: "status", text: "Preparando runtime Python..." });
   await pyodide.runPythonAsync(PY_RUNTIME);
   runUserCode = pyodide.globals.get("run_user_code");
   handleGuiEvent = pyodide.globals.get("handle_gui_event");
-  post("ready");
-})();
+  post({ type: "ready" });
+}
 
 self.onmessage = async (e) => {
-  await initPromise;
+  // O handoff inicial de buffers usa um objeto "cru" (não string), então
+  // esse listener não precisa tratar mensagens vindas de nós mesmos — só
+  // as que chegam do thread principal, que são sempre strings JSON.
+  if (typeof e.data !== "string") return;
   let msg;
   try {
     msg = JSON.parse(e.data);
@@ -463,20 +609,24 @@ self.onmessage = async (e) => {
     try {
       const pkgs = detectPackages(msg.code);
       for (const p of pkgs) {
-        post("status", { text: `Carregando pacote: ${p}...` });
+        post({ type: "status", text: `Carregando pacote: ${p}...` });
         await pyodide.loadPackage(p);
       }
-      post("run-start");
+      post({ type: "run-start" });
       runUserCode(msg.code);
     } catch (err) {
-      post("stderr", { text: String(err) });
-      post("run-end");
+      post({ type: "stderr", text: String(err) });
+      post({ type: "run-end" });
     }
   } else if (msg.type === "gui-event") {
     try {
       handleGuiEvent(JSON.stringify(msg));
     } catch (err) {
-      post("stderr", { text: String(err) });
+      post({ type: "stderr", text: String(err) });
     }
   }
 };
+
+boot().catch((err) => {
+  post({ type: "stderr", text: "Falha ao iniciar o Pyodide: " + String(err) });
+});
