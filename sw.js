@@ -10,13 +10,20 @@
 //    ou nada. Usamos "require-corp" (não "credentialless") porque é o modo
 //    que o Safari/iOS suporta de forma confiável e que o jsDelivr já atende
 //    nativamente (manda Cross-Origin-Resource-Policy: cross-origin).
+//  - worker.js (o script do Worker do Pyodide): PRECISA receber os MESMOS
+//    cabeçalhos COOP/COEP na resposta. A spec exige que, quando o documento
+//    principal usa COEP: require-corp, qualquer worker script carregado por
+//    ele também precisa vir com COEP: require-corp — senão o worker nasce
+//    SEM isolamento (self.crossOriginIsolated === false dentro dele), mesmo
+//    que a janela principal esteja isolada. Era essa a causa do input()
+//    cair no fallback de "isolamento indisponível" mesmo com o SW ativo.
 //  - App shell (demais arquivos do próprio repositório): cache-first, com
 //    atualização em segundo plano.
 //  - Recursos de CDN (Monaco, Pyodide e seus pacotes .whl): cache-first
 //    "para sempre", pois são arquivos versionados e imutáveis — uma vez
 //    baixados, funcionam 100% offline.
 
-const APP_CACHE = "pywebide-app-v2";
+const APP_CACHE = "pywebide-app-v3";
 const CDN_CACHE = "pywebide-cdn-v1";
 
 const APP_SHELL = [
@@ -38,6 +45,18 @@ function withIsolationHeaders(response) {
     statusText: response.statusText,
     headers,
   });
+}
+
+// Requisições que PRECISAM sair com os cabeçalhos de isolamento:
+// - a navegação (documento principal)
+// - o script do worker (worker.js), que é buscado com destination
+//   "worker" pelo new Worker("worker.js")
+function needsIsolationHeaders(request) {
+  return (
+    request.mode === "navigate" ||
+    request.destination === "worker" ||
+    request.destination === "sharedworker"
+  );
 }
 
 self.addEventListener("install", (event) => {
@@ -93,9 +112,10 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Navegação (documento principal): cache-first, mas SEMPRE injetando os
-  // cabeçalhos de isolamento de origem cruzada na resposta final.
-  if (event.request.mode === "navigate") {
+  // Navegação (documento principal) e worker.js: cache-first, mas SEMPRE
+  // injetando os cabeçalhos de isolamento de origem cruzada na resposta
+  // final — os dois precisam deles para o worker nascer isolado.
+  if (needsIsolationHeaders(event.request)) {
     event.respondWith(
       caches.open(APP_CACHE).then(async (cache) => {
         const cached = await cache.match(event.request);
