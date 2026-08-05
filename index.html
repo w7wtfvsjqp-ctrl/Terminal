@@ -668,6 +668,15 @@ janela.mainloop()
   let running = false;
 
   function createWorker() {
+    logLine(`[diag] window.crossOriginIsolated=${window.crossOriginIsolated}`, "sys");
+    fetch("./worker.js", { cache: "no-store" })
+      .then((r) => {
+        logLine(
+          `[diag] headers de worker.js -> COOP="${r.headers.get("cross-origin-opener-policy")}" COEP="${r.headers.get("cross-origin-embedder-policy")}"`,
+          "sys"
+        );
+      })
+      .catch((err) => logLine(`[diag] falha ao checar headers de worker.js: ${err}`, "sys"));
     worker = new Worker("worker.js");
     worker.onmessage = (e) => {
       // A maioria das mensagens vem como string JSON, mas o handoff dos
@@ -744,6 +753,12 @@ janela.mainloop()
         break;
       case "var-set":
         updateVarNodes(msg.id, msg.value);
+        break;
+      case "coi-diag":
+        logLine(
+          `[diag] worker: self.crossOriginIsolated=${msg.workerCrossOriginIsolated} | SharedArrayBuffer definido=${msg.sharedArrayBufferDefined}`,
+          "sys"
+        );
         break;
       case "input-channel":
         if (msg.available) {
